@@ -39,6 +39,7 @@ namespace ARKitBlendShapeGenerator
         private Mesh _originalMesh;
         private Mesh _previewMesh;
         private int _previewBlendShapeIndex = -1;
+        private bool _previewApplied = false;
         private const string PreviewBlendShapeName = "__ARKitGenerator_Preview__";
 
         private void OnEnable()
@@ -428,14 +429,21 @@ namespace ARKitBlendShapeGenerator
             EditorGUILayout.LabelField("マッピング:", GUILayout.Width(70));
             int newSelection = EditorGUILayout.Popup(currentSelection, options);
 
-            bool mappingChanged = false;
-            if (newSelection != currentSelection || _previewMappingIndex < 0)
+            // マッピングが変更されたかチェック
+            bool selectionChanged = newSelection != currentSelection;
+
+            if (selectionChanged)
             {
+                // 選択変更時はリセット
                 ResetPreview();
                 _previewMappingIndex = enabledMappings[newSelection].Index;
-                // マッピング変更時は自動的に強度を1.0に設定
                 _previewWeight = 1.0f;
-                mappingChanged = true;
+            }
+            else if (_previewMappingIndex < 0)
+            {
+                // 初回選択
+                _previewMappingIndex = enabledMappings[newSelection].Index;
+                _previewWeight = 1.0f;
             }
             EditorGUILayout.EndHorizontal();
 
@@ -444,16 +452,20 @@ namespace ARKitBlendShapeGenerator
             EditorGUILayout.LabelField("強度:", GUILayout.Width(70));
             float newWeight = EditorGUILayout.Slider(_previewWeight, 0f, 1f);
 
-            // 重み変更時のみnewWeightを適用、マッピング変更時は_previewWeightを維持
-            if (Mathf.Abs(newWeight - _previewWeight) > 0.001f)
+            // 重み変更チェック
+            bool weightChanged = Mathf.Abs(newWeight - _previewWeight) > 0.001f;
+
+            if (weightChanged)
             {
                 _previewWeight = newWeight;
-                ApplyPreview();
+                _previewApplied = false; // 重み変更時は再適用が必要
             }
-            else if (mappingChanged)
+
+            // プレビューが未適用または選択変更時にApplyPreview
+            if (!_previewApplied || selectionChanged)
             {
-                // _previewWeightは既に1.0に設定済み
                 ApplyPreview();
+                _previewApplied = true;
             }
             EditorGUILayout.EndHorizontal();
 
@@ -664,6 +676,7 @@ namespace ARKitBlendShapeGenerator
             _previewMappingIndex = -1;
             _previewBlendShapeIndex = -1;
             _previewWeight = 0f;
+            _previewApplied = false;
 
             SceneView.RepaintAll();
         }
