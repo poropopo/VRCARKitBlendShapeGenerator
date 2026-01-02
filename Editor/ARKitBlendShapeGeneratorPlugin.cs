@@ -45,6 +45,29 @@ namespace ARKitBlendShapeGenerator
                 return;
             }
 
+            // プレビューメッシュが残っている場合、元のメッシュを復元
+            var currentMesh = renderer.sharedMesh;
+            const string PreviewBlendShapeName = "__ARKitGenerator_Preview__";
+            bool isPreviewMesh = currentMesh.name.Contains("_Preview") ||
+                                 currentMesh.GetBlendShapeIndex(PreviewBlendShapeName) >= 0;
+
+            if (isPreviewMesh)
+            {
+                Debug.LogWarning($"[ARKitGenerator] Preview mesh detected: {currentMesh.name}. Attempting to find original mesh.");
+
+                // 元のメッシュを検索
+                var originalMesh = FindOriginalMeshForBuild(currentMesh, PreviewBlendShapeName);
+                if (originalMesh != null)
+                {
+                    Debug.Log($"[ARKitGenerator] Restored original mesh: {originalMesh.name}");
+                    renderer.sharedMesh = originalMesh;
+                }
+                else
+                {
+                    Debug.LogError("[ARKitGenerator] Cannot find original mesh. Build may produce incorrect results.");
+                }
+            }
+
             var generator = new BlendShapeProcessor(
                 renderer,
                 component.intensityMultiplier,
@@ -56,6 +79,33 @@ namespace ARKitBlendShapeGenerator
             );
 
             generator.Process();
+        }
+
+        private static Mesh FindOriginalMeshForBuild(Mesh previewMesh, string previewBlendShapeName)
+        {
+            string meshName = previewMesh.name;
+            meshName = meshName.Replace("_Preview", "");
+            meshName = meshName.Replace("(Clone)", "");
+            meshName = meshName.Trim();
+
+            string[] guids = UnityEditor.AssetDatabase.FindAssets($"t:Mesh {meshName}");
+            foreach (string guid in guids)
+            {
+                string path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
+                var assets = UnityEditor.AssetDatabase.LoadAllAssetsAtPath(path);
+                foreach (var asset in assets)
+                {
+                    if (asset is Mesh mesh && mesh.name == meshName)
+                    {
+                        if (mesh.GetBlendShapeIndex(previewBlendShapeName) < 0)
+                        {
+                            return mesh;
+                        }
+                    }
+                }
+            }
+
+            return null;
         }
     }
 

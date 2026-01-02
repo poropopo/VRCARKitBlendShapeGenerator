@@ -46,12 +46,27 @@ namespace ARKitBlendShapeGenerator
         {
             _component = (ARKitBlendShapeGeneratorComponent)target;
             RefreshBlendShapeList();
+
+            // Play Modeに入る時にプレビューをリセット
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
         }
 
         private void OnDisable()
         {
+            // イベント登録を解除
+            EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+
             // プレビューをリセット
             ResetPreview();
+        }
+
+        private void OnPlayModeStateChanged(PlayModeStateChange state)
+        {
+            // Play Modeに入る直前にプレビューをリセット
+            if (state == PlayModeStateChange.ExitingEditMode)
+            {
+                ResetPreview();
+            }
         }
 
         private void RefreshBlendShapeList()
@@ -434,10 +449,10 @@ namespace ARKitBlendShapeGenerator
 
             if (selectionChanged)
             {
-                // 選択変更時はリセット
-                ResetPreview();
+                // 選択変更時はプレビューBlendShapeを再生成（元のメッシュは保持）
                 _previewMappingIndex = enabledMappings[newSelection].Index;
                 _previewWeight = 1.0f;
+                _previewApplied = false; // 再適用が必要
             }
             else if (_previewMappingIndex < 0)
             {
@@ -521,7 +536,40 @@ namespace ARKitBlendShapeGenerator
             // 元のメッシュを保存（初回のみ）
             if (_originalMesh == null)
             {
-                _originalMesh = _component.targetRenderer.sharedMesh;
+                var currentMesh = _component.targetRenderer.sharedMesh;
+                if (currentMesh == null)
+                {
+                    Debug.LogWarning("[ARKitGenerator Preview] No mesh on target renderer");
+                    _previewApplied = true; // prevent infinite retry
+                    return;
+                }
+
+                // 既にプレビューBlendShapeが含まれている場合、またはプレビューメッシュ名の場合
+                int existingPreviewIndex = currentMesh.GetBlendShapeIndex(PreviewBlendShapeName);
+                bool isPreviewMesh = currentMesh.name.Contains("_Preview") || existingPreviewIndex >= 0;
+
+                if (isPreviewMesh)
+                {
+                    // 元のメッシュアセットを検索
+                    var originalMesh = FindOriginalMeshAsset(currentMesh);
+                    if (originalMesh != null)
+                    {
+                        Debug.Log($"[ARKitGenerator Preview] Found original mesh asset: {originalMesh.name}");
+                        _originalMesh = originalMesh;
+                        _component.targetRenderer.sharedMesh = _originalMesh;
+                    }
+                    else
+                    {
+                        Debug.LogWarning("[ARKitGenerator Preview] Cannot find original mesh. Preview disabled until scene is reloaded.");
+                        _previewApplied = true; // prevent infinite retry
+                        return;
+                    }
+                }
+                else
+                {
+                    _originalMesh = currentMesh;
+                }
+
                 _previewMesh = UnityEngine.Object.Instantiate(_originalMesh);
                 _previewMesh.name = _originalMesh.name + "_Preview";
 
@@ -531,7 +579,7 @@ namespace ARKitBlendShapeGenerator
                     _originalWeights[i] = _component.targetRenderer.GetBlendShapeWeight(i);
                 }
 
-                Debug.Log($"[ARKitGenerator Preview] Initialized preview mesh from {_originalMesh.name}");
+                Debug.Log($"[ARKitGenerator Preview] Initialized preview mesh from {_originalMesh.name}, blendShapeCount={_originalMesh.blendShapeCount}");
             }
 
             // 既存のプレビューBlendShapeがあれば、新しいメッシュを作り直す
@@ -575,8 +623,8 @@ namespace ARKitBlendShapeGenerator
             var deltaNormals = new Vector3[vertexCount];
             var deltaTangents = new Vector3[vertexCount];
 
-            // メッシュの頂点座標を取得（左右判定用）
-            var vertices = _previewMesh.vertices;
+            // メッシュの頂点座標を取得（左右判定用）- 元のメッシュから取得
+            var vertices = _originalMesh.vertices;
 
             int sourceCount = 0;
             // ソースBlendShapeを合成
@@ -588,7 +636,8 @@ namespace ARKitBlendShapeGenerator
                     continue;
                 }
 
-                int srcIndex = _previewMesh.GetBlendShapeIndex(source.blendShapeName);
+                // 元のメッシュからBlendShapeインデックスを取得（重要！）
+                int srcIndex = _originalMesh.GetBlendShapeIndex(source.blendShapeName);
                 if (srcIndex < 0)
                 {
                     Debug.LogWarning($"[ARKitGenerator Preview] Source blendshape not found: {source.blendShapeName}");
@@ -599,15 +648,28 @@ namespace ARKitBlendShapeGenerator
                 var srcDeltaN = new Vector3[vertexCount];
                 var srcDeltaT = new Vector3[vertexCount];
 
-                int frameCount = _previewMesh.GetBlendShapeFrameCount(srcIndex);
+                // 元のメッシュからフレーム数を取得（重要！）
+                int frameCount = _originalMesh.GetBlendShapeFrameCount(srcIndex);
                 if (frameCount == 0)
                 {
                     Debug.LogWarning($"[ARKitGenerator Preview] Source blendshape has no frames: {source.blendShapeName}");
                     continue;
                 }
 
-                _previewMesh.GetBlendShapeFrameVertices(srcIndex, 0, srcDeltaV, srcDeltaN, srcDeltaT);
-                Debug.Log($"[ARKitGenerator Preview] Got frame vertices for {source.blendShapeName}");
+                // 最後のフレーム（通常100%のフレーム）を使用（ビルド処理と同じ）
+                int targetFrame = frameCount > 0 ? frameCount - 1 : 0;
+                _originalMesh.GetBlendShapeFrameVertices(srcIndex, targetFrame, srcDeltaV, srcDeltaN, srcDeltaT);
+
+                // ソースデルタの詳細をログ
+                float srcMaxDelta = 0f;
+                int srcNonZeroCount = 0;
+                for (int i = 0; i < vertexCount; i++)
+                {
+                    float mag = srcDeltaV[i].magnitude;
+                    if (mag > srcMaxDelta) srcMaxDelta = mag;
+                    if (mag > 0.0001f) srcNonZeroCount++;
+                }
+                Debug.Log($"[ARKitGenerator Preview] Source '{source.blendShapeName}' (frame {targetFrame}/{frameCount}): maxDelta={srcMaxDelta:F6}, nonZero={srcNonZeroCount}/{vertexCount}");
 
                 // intensityMultiplierを適用（本番処理と同じ）
                 float adjustedWeight = source.weight * _component.intensityMultiplier;
@@ -645,7 +707,17 @@ namespace ARKitBlendShapeGenerator
             _previewMesh.AddBlendShapeFrame(PreviewBlendShapeName, 100f, deltaVertices, deltaNormals, deltaTangents);
             _previewBlendShapeIndex = _previewMesh.blendShapeCount - 1;
 
+            // デバッグ: デルタ頂点の統計情報
+            float maxDelta = 0f;
+            int nonZeroCount = 0;
+            for (int i = 0; i < vertexCount; i++)
+            {
+                float mag = deltaVertices[i].magnitude;
+                if (mag > maxDelta) maxDelta = mag;
+                if (mag > 0.0001f) nonZeroCount++;
+            }
             Debug.Log($"[ARKitGenerator Preview] Generated preview blendshape at index {_previewBlendShapeIndex} from {sourceCount} sources");
+            Debug.Log($"[ARKitGenerator Preview] Delta stats: maxMagnitude={maxDelta:F6}, nonZeroVertices={nonZeroCount}/{vertexCount}");
         }
 
         private void ResetPreview()
@@ -679,6 +751,62 @@ namespace ARKitBlendShapeGenerator
             _previewApplied = false;
 
             SceneView.RepaintAll();
+        }
+
+        /// <summary>
+        /// プレビューメッシュから元のメッシュアセットを検索する
+        /// </summary>
+        private Mesh FindOriginalMeshAsset(Mesh previewMesh)
+        {
+            // メッシュ名からプレビュー関連の接尾辞を削除
+            string meshName = previewMesh.name;
+            meshName = meshName.Replace("_Preview", "");
+            meshName = meshName.Replace("(Clone)", "");
+            meshName = meshName.Trim();
+
+            Debug.Log($"[ARKitGenerator Preview] Searching for original mesh with name: {meshName}");
+
+            // アセットデータベースから検索
+            string[] guids = UnityEditor.AssetDatabase.FindAssets($"t:Mesh {meshName}");
+            foreach (string guid in guids)
+            {
+                string path = UnityEditor.AssetDatabase.GUIDToAssetPath(guid);
+                var assets = UnityEditor.AssetDatabase.LoadAllAssetsAtPath(path);
+                foreach (var asset in assets)
+                {
+                    if (asset is Mesh mesh && mesh.name == meshName)
+                    {
+                        // プレビューBlendShapeが含まれていないことを確認
+                        if (mesh.GetBlendShapeIndex(PreviewBlendShapeName) < 0)
+                        {
+                            return mesh;
+                        }
+                    }
+                }
+            }
+
+            // 名前で見つからない場合、SkinnedMeshRendererの元のメッシュを探す
+            // （FBXなどからインポートされたメッシュの場合、名前が異なる可能性がある）
+            var prefabStage = UnityEditor.SceneManagement.PrefabStageUtility.GetCurrentPrefabStage();
+            if (prefabStage != null)
+            {
+                // プレハブステージの場合、元のプレハブからメッシュを取得
+                string prefabPath = prefabStage.assetPath;
+                var prefabAsset = UnityEditor.AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath);
+                if (prefabAsset != null)
+                {
+                    var smr = prefabAsset.GetComponentInChildren<SkinnedMeshRenderer>();
+                    if (smr != null && smr.sharedMesh != null)
+                    {
+                        if (smr.sharedMesh.GetBlendShapeIndex(PreviewBlendShapeName) < 0)
+                        {
+                            return smr.sharedMesh;
+                        }
+                    }
+                }
+            }
+
+            return null;
         }
 
         private void DrawAutoMappingsInfo()
