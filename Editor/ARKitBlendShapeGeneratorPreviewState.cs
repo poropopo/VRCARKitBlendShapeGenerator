@@ -51,6 +51,9 @@ namespace ARKitBlendShapeGenerator
         public static readonly PublishedValue<Snapshot> RuntimeState = new PublishedValue<Snapshot>(
             EmptySnapshot,
             debugName: "ARKitBlendShapeGenerator/PreviewRuntimeState");
+        public static readonly PublishedValue<int> ComponentConfigRevision = new PublishedValue<int>(
+            0,
+            debugName: "ARKitBlendShapeGenerator/ComponentConfigRevision");
 
         public static Snapshot Current => RuntimeState.Value;
 
@@ -149,6 +152,11 @@ namespace ARKitBlendShapeGenerator
                 interactiveEnabled: true,
                 revision: current.Revision + 1,
                 weightsByArkitName: nextWeights);
+        }
+
+        public static void NotifyComponentConfigurationChanged()
+        {
+            ComponentConfigRevision.Value = ComponentConfigRevision.Value + 1;
         }
 
     }

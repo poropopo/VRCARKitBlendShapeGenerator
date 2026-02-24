@@ -178,6 +178,8 @@ namespace ARKitBlendShapeGenerator
 
                 if (refreshedPrimary != this)
                 {
+                    DestroyImmediate(this);
+
                     if (!Application.isBatchMode)
                     {
                         EditorUtility.DisplayDialog(
@@ -186,8 +188,6 @@ namespace ARKitBlendShapeGenerator
                             "重複して追加されたコンポーネントを削除しました。",
                             "OK");
                     }
-
-                    DestroyImmediate(this);
                 }
             };
         }

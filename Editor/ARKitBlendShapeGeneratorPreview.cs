@@ -131,6 +131,7 @@ namespace ARKitBlendShapeGenerator
                 context.Observe(component, c => c.blendWidth);
                 context.Observe(component, c => c.overwriteExisting);
                 context.Observe(component, c => c.targetRenderer);
+                context.Observe(ARKitBlendShapeGeneratorPreviewState.ComponentConfigRevision);
 
                 context.Observe(originalRenderer, r => r.sharedMesh);
                 context.Observe(proxyRenderer, r => r.sharedMesh);
@@ -160,13 +161,8 @@ namespace ARKitBlendShapeGenerator
                 ComputeContext context,
                 RenderAspects updatedAspects)
             {
-                // メッシュが変わった場合は再生成が必要
-                if ((updatedAspects & RenderAspects.Mesh) != 0)
-                {
-                    return Task.FromResult<IRenderFilterNode>(null);
-                }
-
-                return Task.FromResult<IRenderFilterNode>(this);
+                // 設定変更・メッシュ変更のどちらでも再生成して差分を確実に反映する。
+                return Task.FromResult<IRenderFilterNode>(null);
             }
 
             public void OnFrame(Renderer original, Renderer proxy)
