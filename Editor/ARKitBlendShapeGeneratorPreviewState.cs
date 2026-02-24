@@ -70,7 +70,6 @@ namespace ARKitBlendShapeGenerator
                 return;
             }
 
-            // 最後に操作した1コンポーネントのみを有効にする。
             RuntimeState.Value = new Snapshot(
                 activeComponentInstanceId: componentInstanceId,
                 interactiveEnabled: true,
@@ -129,13 +128,15 @@ namespace ARKitBlendShapeGenerator
 
         public static void SetAllWeights(int componentInstanceId, IEnumerable<string> arkitNames, float value)
         {
-            if (componentInstanceId == 0 || arkitNames == null)
+            if (componentInstanceId == 0)
             {
                 return;
             }
 
             float clamped = Mathf.Clamp01(value);
-            var names = arkitNames.Where(n => !string.IsNullOrEmpty(n)).Distinct().ToList();
+            var names = arkitNames != null
+                ? arkitNames.Where(n => !string.IsNullOrEmpty(n)).Distinct().ToList()
+                : new List<string>();
             var nextWeights = new Dictionary<string, float>();
 
             if (clamped > 0.0001f)

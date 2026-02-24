@@ -91,8 +91,20 @@ namespace ARKitBlendShapeGenerator
             IEnumerable<(Renderer, Renderer)> proxyPairs,
             ComputeContext context)
         {
-            var (original, proxy) = proxyPairs.First();
+            if (group == null || proxyPairs == null)
+            {
+                return Task.FromResult<IRenderFilterNode>(null);
+            }
+
+            var pair = proxyPairs.FirstOrDefault();
+            var original = pair.Item1;
+            var proxy = pair.Item2;
             var component = group.GetData<ARKitBlendShapeGeneratorComponent>();
+
+            if (component == null)
+            {
+                return Task.FromResult<IRenderFilterNode>(null);
+            }
 
             if (original is not SkinnedMeshRenderer originalSmr ||
                 proxy is not SkinnedMeshRenderer proxySmr)
@@ -110,9 +122,13 @@ namespace ARKitBlendShapeGenerator
         private class PreviewNode : IRenderFilterNode
         {
             private Mesh _generatedMesh;
+            private readonly ARKitBlendShapeGeneratorComponent _component;
             private readonly int _componentInstanceId;
+            private readonly int _observedComponentConfigRevision;
+            private readonly int _observedTargetRendererInstanceId;
             private readonly Dictionary<string, int> _shapeIndices = new Dictionary<string, int>();
-            private readonly HashSet<int> _appliedInteractiveIndices = new HashSet<int>();
+            private HashSet<int> _appliedInteractiveIndices = new HashSet<int>();
+            private HashSet<int> _nextAppliedInteractiveIndices = new HashSet<int>();
 
             public RenderAspects WhatChanged => RenderAspects.Mesh | RenderAspects.Shapes;
 
@@ -122,16 +138,22 @@ namespace ARKitBlendShapeGenerator
                 SkinnedMeshRenderer proxyRenderer,
                 ComputeContext context)
             {
+                _component = component;
                 _componentInstanceId = component != null ? component.GetInstanceID() : 0;
+                _observedComponentConfigRevision = context.Observe(ARKitBlendShapeGeneratorPreviewState.ComponentConfigRevision);
 
                 // customMappingsの内容を含むコンポーネント変更全体を監視
-                context.Observe(component);
-                context.Observe(component, c => c.intensityMultiplier);
-                context.Observe(component, c => c.enableLeftRightSplit);
-                context.Observe(component, c => c.blendWidth);
-                context.Observe(component, c => c.overwriteExisting);
-                context.Observe(component, c => c.targetRenderer);
-                context.Observe(ARKitBlendShapeGeneratorPreviewState.ComponentConfigRevision);
+                SkinnedMeshRenderer observedTargetRenderer = null;
+                if (component != null)
+                {
+                    context.Observe(component);
+                    context.Observe(component, c => c.intensityMultiplier);
+                    context.Observe(component, c => c.enableLeftRightSplit);
+                    context.Observe(component, c => c.blendWidth);
+                    context.Observe(component, c => c.overwriteExisting);
+                    observedTargetRenderer = context.Observe(component, c => c.targetRenderer);
+                }
+                _observedTargetRendererInstanceId = observedTargetRenderer != null ? observedTargetRenderer.GetInstanceID() : 0;
 
                 context.Observe(originalRenderer, r => r.sharedMesh);
                 context.Observe(proxyRenderer, r => r.sharedMesh);
@@ -145,12 +167,17 @@ namespace ARKitBlendShapeGenerator
                 _generatedMesh = Object.Instantiate(sourceMesh);
                 _generatedMesh.name = sourceMesh.name + "_ARKitPreview";
 
+                var customMappings = component != null ? component.customMappings : null;
+                var options = component != null
+                    ? BlendShapeGenerationOptions.FromComponent(component)
+                    : new BlendShapeGenerationOptions();
+
                 BlendShapeGenerationEngine.Generate(
                     sourceMesh,
                     _generatedMesh,
-                    component.customMappings,
+                    customMappings,
                     BlendShapeProcessor.GetMappingTable(),
-                    BlendShapeGenerationOptions.FromComponent(component));
+                    options);
 
                 CacheShapeIndices(_generatedMesh);
                 proxyRenderer.sharedMesh = _generatedMesh;
@@ -161,8 +188,40 @@ namespace ARKitBlendShapeGenerator
                 ComputeContext context,
                 RenderAspects updatedAspects)
             {
-                // 設定変更・メッシュ変更のどちらでも再生成して差分を確実に反映する。
-                return Task.FromResult<IRenderFilterNode>(null);
+                if (_generatedMesh == null || proxyPairs == null)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                int currentConfigRevision = context.Observe(ARKitBlendShapeGeneratorPreviewState.ComponentConfigRevision);
+                if (currentConfigRevision != _observedComponentConfigRevision)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                if ((updatedAspects & RenderAspects.Mesh) != 0)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                if (_component != null)
+                {
+                    var currentTargetRenderer = context.Observe(_component, c => c.targetRenderer);
+                    int currentTargetRendererId = currentTargetRenderer != null ? currentTargetRenderer.GetInstanceID() : 0;
+                    if (currentTargetRendererId != _observedTargetRendererInstanceId)
+                    {
+                        return Task.FromResult<IRenderFilterNode>(null);
+                    }
+                }
+
+                var pair = proxyPairs.FirstOrDefault();
+                if (pair.Item1 is not SkinnedMeshRenderer ||
+                    pair.Item2 is not SkinnedMeshRenderer)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                return Task.FromResult<IRenderFilterNode>(this);
             }
 
             public void OnFrame(Renderer original, Renderer proxy)
@@ -183,7 +242,7 @@ namespace ARKitBlendShapeGenerator
                     return;
                 }
 
-                var nextAppliedIndices = new HashSet<int>();
+                _nextAppliedInteractiveIndices.Clear();
                 foreach (var kvp in interactiveState.WeightsByArkitName)
                 {
                     if (!_shapeIndices.TryGetValue(kvp.Key, out int blendShapeIndex))
@@ -198,22 +257,20 @@ namespace ARKitBlendShapeGenerator
                     }
 
                     proxySmr.SetBlendShapeWeight(blendShapeIndex, clamped);
-                    nextAppliedIndices.Add(blendShapeIndex);
+                    _nextAppliedInteractiveIndices.Add(blendShapeIndex);
                 }
 
                 foreach (int previouslyAppliedIndex in _appliedInteractiveIndices)
                 {
-                    if (!nextAppliedIndices.Contains(previouslyAppliedIndex))
+                    if (!_nextAppliedInteractiveIndices.Contains(previouslyAppliedIndex))
                     {
                         proxySmr.SetBlendShapeWeight(previouslyAppliedIndex, 0f);
                     }
                 }
 
-                _appliedInteractiveIndices.Clear();
-                foreach (int appliedIndex in nextAppliedIndices)
-                {
-                    _appliedInteractiveIndices.Add(appliedIndex);
-                }
+                var swap = _appliedInteractiveIndices;
+                _appliedInteractiveIndices = _nextAppliedInteractiveIndices;
+                _nextAppliedInteractiveIndices = swap;
             }
 
             private void CacheShapeIndices(Mesh mesh)
@@ -239,6 +296,7 @@ namespace ARKitBlendShapeGenerator
             public void Dispose()
             {
                 _appliedInteractiveIndices.Clear();
+                _nextAppliedInteractiveIndices.Clear();
 
                 if (_generatedMesh != null)
                 {
@@ -254,6 +312,7 @@ namespace ARKitBlendShapeGenerator
                 }
 
                 _appliedInteractiveIndices.Clear();
+                _nextAppliedInteractiveIndices.Clear();
             }
         }
     }
