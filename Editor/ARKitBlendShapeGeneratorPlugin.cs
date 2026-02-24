@@ -20,14 +20,42 @@ namespace ARKitBlendShapeGenerator
                 .Run("Generate ARKit BlendShapes", ctx =>
                 {
                     var components = ctx.AvatarRootObject
-                        .GetComponentsInChildren<ARKitBlendShapeGeneratorComponent>(true);
+                        .GetComponentsInChildren<ARKitBlendShapeGeneratorComponent>(true)
+                        .Where(c => c != null)
+                        .ToArray();
+                    var primaryComponent = SelectPrimaryComponent(ctx.AvatarRootObject, components);
 
-                    foreach (var component in components)
+                    if (components.Length > 1 && primaryComponent != null)
                     {
-                        ProcessComponent(component, ctx);
+                        Debug.LogWarning(
+                            $"[ARKitGenerator] 同一アバター内で複数のARKitBlendShapeGeneratorComponentが検出されました。\"{primaryComponent.name}\" のみ処理します。",
+                            primaryComponent);
+                    }
+
+                    if (primaryComponent != null)
+                    {
+                        ProcessComponent(primaryComponent, ctx);
                     }
                 })
                 .PreviewingWith(new ARKitBlendShapeGeneratorPreview());
+        }
+
+        private static ARKitBlendShapeGeneratorComponent SelectPrimaryComponent(
+            GameObject avatarRoot,
+            ARKitBlendShapeGeneratorComponent[] components)
+        {
+            if (components == null || components.Length == 0)
+            {
+                return null;
+            }
+
+            var onRoot = components.FirstOrDefault(c => c != null && c.gameObject == avatarRoot);
+            if (onRoot != null)
+            {
+                return onRoot;
+            }
+
+            return components[0];
         }
 
         private void ProcessComponent(ARKitBlendShapeGeneratorComponent component, BuildContext ctx)

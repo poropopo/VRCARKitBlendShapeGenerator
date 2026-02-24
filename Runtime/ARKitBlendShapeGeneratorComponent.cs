@@ -1,7 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using VRC.SDKBase;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 
 namespace ARKitBlendShapeGenerator
 {
@@ -45,6 +49,11 @@ namespace ARKitBlendShapeGenerator
         [Tooltip("デバッグログを出力する")]
         public bool debugMode = false;
 
+#if UNITY_EDITOR
+        [NonSerialized]
+        private bool _pendingDuplicateRemoval;
+#endif
+
         private void Reset()
         {
             // 自動でBodyメッシュを検索
@@ -52,6 +61,13 @@ namespace ARKitBlendShapeGenerator
 
             // デフォルトのカスタムマッピングを追加（視線系）
             InitializeDefaultCustomMappings();
+        }
+
+        private void OnValidate()
+        {
+#if UNITY_EDITOR
+            EnforceSingleComponentPerAvatar();
+#endif
         }
 
         private SkinnedMeshRenderer FindBodyMesh()
@@ -108,6 +124,142 @@ namespace ARKitBlendShapeGenerator
 
             return result;
         }
+
+#if UNITY_EDITOR
+        private void EnforceSingleComponentPerAvatar()
+        {
+            var avatarRoot = FindAvatarRootForUniqueness();
+            if (avatarRoot == null)
+            {
+                return;
+            }
+
+            var components = avatarRoot.GetComponentsInChildren<ARKitBlendShapeGeneratorComponent>(true)
+                .Where(c => c != null)
+                .ToArray();
+
+            if (components.Length <= 1)
+            {
+                _pendingDuplicateRemoval = false;
+                return;
+            }
+
+            var primary = SelectPrimaryComponent(avatarRoot, components);
+            if (primary == this)
+            {
+                _pendingDuplicateRemoval = false;
+                return;
+            }
+
+            if (_pendingDuplicateRemoval)
+            {
+                return;
+            }
+
+            _pendingDuplicateRemoval = true;
+
+            Debug.LogWarning(
+                "[ARKitGenerator] 同一アバター内にはARKitBlendShapeGeneratorComponentを1つだけ設定できます。重複コンポーネントを削除します。",
+                this);
+
+            EditorApplication.delayCall += () =>
+            {
+                _pendingDuplicateRemoval = false;
+
+                if (this == null || avatarRoot == null)
+                {
+                    return;
+                }
+
+                var refreshed = avatarRoot.GetComponentsInChildren<ARKitBlendShapeGeneratorComponent>(true)
+                    .Where(c => c != null)
+                    .ToArray();
+                var refreshedPrimary = SelectPrimaryComponent(avatarRoot, refreshed);
+
+                if (refreshedPrimary != this)
+                {
+                    if (!Application.isBatchMode)
+                    {
+                        EditorUtility.DisplayDialog(
+                            "ARKit BlendShape Generator",
+                            "同一アバター内には ARKitBlendShapeGeneratorComponent を1つだけ設定できます。\n\n" +
+                            "重複して追加されたコンポーネントを削除しました。",
+                            "OK");
+                    }
+
+                    DestroyImmediate(this);
+                }
+            };
+        }
+
+        private Transform FindAvatarRootForUniqueness()
+        {
+            Transform lastDescriptorRoot = null;
+            var cursor = transform;
+
+            while (cursor != null)
+            {
+                if (HasAvatarDescriptor(cursor.gameObject))
+                {
+                    lastDescriptorRoot = cursor;
+                }
+
+                cursor = cursor.parent;
+            }
+
+            if (lastDescriptorRoot != null)
+            {
+                return lastDescriptorRoot;
+            }
+
+            return transform.root;
+        }
+
+        private static bool HasAvatarDescriptor(GameObject go)
+        {
+            if (go == null)
+            {
+                return false;
+            }
+
+            var components = go.GetComponents<Component>();
+            foreach (var component in components)
+            {
+                if (component == null)
+                {
+                    continue;
+                }
+
+                if (component.GetType().Name == "VRCAvatarDescriptor")
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static ARKitBlendShapeGeneratorComponent SelectPrimaryComponent(
+            Transform avatarRoot,
+            ARKitBlendShapeGeneratorComponent[] components)
+        {
+            if (components == null || components.Length == 0)
+            {
+                return null;
+            }
+
+            if (avatarRoot != null)
+            {
+                var onRoot = components.FirstOrDefault(c => c != null && c.transform == avatarRoot);
+                if (onRoot != null)
+                {
+                    return onRoot;
+                }
+            }
+
+            return components[0];
+        }
+#endif
     }
 
     /// <summary>
