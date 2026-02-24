@@ -1,4 +1,3 @@
-using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
@@ -74,9 +73,7 @@ namespace ARKitBlendShapeGenerator
         private readonly List<CustomBlendShapeMapping> _customMappings;
         private readonly bool _debug;
 
-        private Dictionary<string, int> _existingShapes;
         private List<string> _generatedShapes = new List<string>();
-        private HashSet<string> _customMappedNames = new HashSet<string>();
 
         public BlendShapeProcessor(
             SkinnedMeshRenderer renderer,
@@ -97,12 +94,6 @@ namespace ARKitBlendShapeGenerator
             _customMappings = customMappings ?? new List<CustomBlendShapeMapping>();
             _debug = debug;
 
-            // 既存のBlendShapeをインデックス化（元のメッシュから）
-            _existingShapes = new Dictionary<string, int>();
-            for (int i = 0; i < _originalMesh.blendShapeCount; i++)
-            {
-                _existingShapes[_originalMesh.GetBlendShapeName(i)] = i;
-            }
         }
 
         public void Process()
@@ -110,315 +101,25 @@ namespace ARKitBlendShapeGenerator
             Log($"Processing mesh: {_mesh.name}, existing shapes: {_mesh.blendShapeCount}");
             Log($"Original mesh: {_originalMesh.name}, blendShapeCount: {_originalMesh.blendShapeCount}, isReadable: {_originalMesh.isReadable}");
 
-            // 1. カスタムマッピングを先に処理
-            ProcessCustomMappings();
-
-            // 2. 自動マッピングを処理（カスタムで定義されたものはスキップ）
-            ProcessAutoMappings();
+            var result = BlendShapeGenerationEngine.Generate(
+                _originalMesh,
+                _mesh,
+                _customMappings,
+                GetMappingTable(),
+                new BlendShapeGenerationOptions
+                {
+                    IntensityMultiplier = _intensity,
+                    EnableLeftRightSplit = _enableSplit,
+                    BlendWidth = _blendWidth,
+                    OverwriteExisting = _overwrite,
+                    Debug = _debug
+                });
+            _generatedShapes = result.GeneratedShapes.ToList();
 
             // メッシュを適用
             _renderer.sharedMesh = _mesh;
 
             Log($"Generated {_generatedShapes.Count} BlendShapes: {string.Join(", ", _generatedShapes)}");
-        }
-
-        private void ProcessCustomMappings()
-        {
-            foreach (var mapping in _customMappings)
-            {
-                if (!mapping.enabled || string.IsNullOrEmpty(mapping.arkitName))
-                    continue;
-
-                if (mapping.sources == null || mapping.sources.Count == 0)
-                    continue;
-
-                // カスタムマッピングで処理した名前を記録
-                _customMappedNames.Add(mapping.arkitName);
-
-                // 既に存在し、上書きしない場合はスキップ
-                if (_existingShapes.ContainsKey(mapping.arkitName) && !_overwrite)
-                {
-                    Log($"Skip custom (exists): {mapping.arkitName}");
-                    continue;
-                }
-
-                // ソースを検索（side情報付き）
-                var sources = new List<(int index, float weight, BlendShapeSide side)>();
-                foreach (var src in mapping.sources)
-                {
-                    if (string.IsNullOrEmpty(src.blendShapeName))
-                        continue;
-
-                    if (_existingShapes.TryGetValue(src.blendShapeName, out int index))
-                    {
-                        sources.Add((index, src.weight, src.side));
-                    }
-                    else
-                    {
-                        Log($"Warning: Source not found: {src.blendShapeName} for {mapping.arkitName}");
-                    }
-                }
-
-                if (sources.Count == 0)
-                {
-                    Log($"Skip custom (no valid source): {mapping.arkitName}");
-                    continue;
-                }
-
-                // BlendShapeを生成（side対応版）
-                GenerateBlendShapeWithSide(mapping.arkitName, sources);
-            }
-        }
-
-        private void ProcessAutoMappings()
-        {
-            var mappings = GetMappingTable();
-
-            // 処理済みのARKit名を追跡（自動マッピング内での重複を管理）
-            var processedArkitNames = new HashSet<string>();
-
-            foreach (var mapping in mappings)
-            {
-                // カスタムマッピングで既に処理済みならスキップ
-                if (_customMappedNames.Contains(mapping.arkitName))
-                {
-                    Log($"Skip auto (custom defined): {mapping.arkitName}");
-                    continue;
-                }
-
-                // 既にこの自動マッピング処理内で生成済みならスキップ
-                if (processedArkitNames.Contains(mapping.arkitName))
-                {
-                    Log($"Skip auto (already generated in this pass): {mapping.arkitName}");
-                    continue;
-                }
-
-                // 元のメッシュに既に存在し、上書きしない場合はスキップ
-                // 注: _existingShapesは元のメッシュのBlendShapeのみを含む（生成したものは含まない）
-                if (_existingShapes.ContainsKey(mapping.arkitName) && !_overwrite)
-                {
-                    Log($"Skip auto (exists in original): {mapping.arkitName}");
-                    continue;
-                }
-
-                // ソースBlendShapeを検索
-                var sources = FindSources(mapping.sources);
-                if (sources.Count == 0)
-                {
-                    Log($"Skip auto (no source): {mapping.arkitName}");
-                    continue;
-                }
-
-                // 左右分割が有効で、かつマッピングにside指定がある場合は左右フィルタリング版を使用
-                if (_enableSplit && mapping.side != BlendShapeSide.Both)
-                {
-                    var sourcesWithSide = sources.Select(s => (s.index, s.weight, mapping.side)).ToList();
-                    GenerateBlendShapeWithSide(mapping.arkitName, sourcesWithSide);
-                }
-                else
-                {
-                    GenerateBlendShape(mapping.arkitName, sources);
-                }
-
-                // 処理済みとしてマーク
-                processedArkitNames.Add(mapping.arkitName);
-            }
-        }
-
-        private List<(int index, float weight)> FindSources(List<SourceMapping> mappings)
-        {
-            var result = new List<(int, float)>();
-
-            foreach (var src in mappings)
-            {
-                foreach (var name in src.names)
-                {
-                    if (_existingShapes.TryGetValue(name, out int index))
-                    {
-                        result.Add((index, src.weight));
-                        break; // 最初に見つかったものを使用
-                    }
-                }
-            }
-
-            return result;
-        }
-
-        private void GenerateBlendShape(string name, List<(int index, float weight)> sources)
-        {
-            int vertexCount = _originalMesh.vertexCount;
-            var deltaVertices = new Vector3[vertexCount];
-            var deltaNormals = new Vector3[vertexCount];
-            var deltaTangents = new Vector3[vertexCount];
-
-            // ソースBlendShapeを合成（元のメッシュからデルタを取得）
-            foreach (var (index, weight) in sources)
-            {
-                var srcDeltaV = new Vector3[vertexCount];
-                var srcDeltaN = new Vector3[vertexCount];
-                var srcDeltaT = new Vector3[vertexCount];
-
-                // 最後のフレーム（通常100%のフレーム）を使用
-                int frameCount = _originalMesh.GetBlendShapeFrameCount(index);
-                int targetFrame = frameCount > 0 ? frameCount - 1 : 0;
-                _originalMesh.GetBlendShapeFrameVertices(index, targetFrame, srcDeltaV, srcDeltaN, srcDeltaT);
-
-                float adjustedWeight = weight * _intensity;
-                for (int i = 0; i < vertexCount; i++)
-                {
-                    deltaVertices[i] += srcDeltaV[i] * adjustedWeight;
-                    deltaNormals[i] += srcDeltaN[i] * adjustedWeight;
-                    deltaTangents[i] += srcDeltaT[i] * adjustedWeight;
-                }
-            }
-
-            // 既存のBlendShapeを上書きする場合は先に削除（Unityは直接削除できないため新規追加のみ）
-            // 注: 実際には同名で追加すると後のものが優先される
-
-            // BlendShapeを追加
-            _mesh.AddBlendShapeFrame(name, 100f, deltaVertices, deltaNormals, deltaTangents);
-            _existingShapes[name] = _mesh.blendShapeCount - 1;
-            _generatedShapes.Add(name);
-
-            Log($"Generated: {name} from {sources.Count} source(s)");
-        }
-
-        /// <summary>
-        /// 左右フィルタリング対応のBlendShape生成
-        /// </summary>
-        private void GenerateBlendShapeWithSide(string name, List<(int index, float weight, BlendShapeSide side)> sources)
-        {
-            int vertexCount = _originalMesh.vertexCount;
-            var deltaVertices = new Vector3[vertexCount];
-            var deltaNormals = new Vector3[vertexCount];
-            var deltaTangents = new Vector3[vertexCount];
-
-            // メッシュの頂点座標を取得（左右判定用）- 元のメッシュから
-            var vertices = _originalMesh.vertices;
-
-            // デバッグ用: 頂点のX座標範囲を調査
-            if (_debug)
-            {
-                float minX = float.MaxValue, maxX = float.MinValue;
-                foreach (var v in vertices)
-                {
-                    if (v.x < minX) minX = v.x;
-                    if (v.x > maxX) maxX = v.x;
-                }
-                Log($"Mesh vertex X range: {minX:F4} to {maxX:F4}");
-            }
-
-            // ソースBlendShapeを合成（元のメッシュからデルタを取得）
-            foreach (var (index, weight, side) in sources)
-            {
-                var srcDeltaV = new Vector3[vertexCount];
-                var srcDeltaN = new Vector3[vertexCount];
-                var srcDeltaT = new Vector3[vertexCount];
-
-                // フレーム情報を取得（元のメッシュから）
-                int frameCount = _originalMesh.GetBlendShapeFrameCount(index);
-                string shapeName = _originalMesh.GetBlendShapeName(index);
-
-                if (_debug)
-                {
-                    Log($"  BlendShape '{shapeName}' (index={index}): frameCount={frameCount}");
-                    for (int f = 0; f < frameCount; f++)
-                    {
-                        float frameWeight = _originalMesh.GetBlendShapeFrameWeight(index, f);
-                        Log($"    Frame {f}: weight={frameWeight}");
-                    }
-                }
-
-                // 最後のフレーム（通常100%のフレーム）を使用
-                int targetFrame = frameCount > 0 ? frameCount - 1 : 0;
-                _originalMesh.GetBlendShapeFrameVertices(index, targetFrame, srcDeltaV, srcDeltaN, srcDeltaT);
-
-                float adjustedWeight = weight * _intensity;
-
-                // デバッグ用カウンター
-                int leftCount = 0, rightCount = 0, centerCount = 0, appliedCount = 0;
-                int hasMovementCount = 0;
-
-                for (int i = 0; i < vertexCount; i++)
-                {
-                    // デルタが存在するか確認
-                    bool hasMovement = srcDeltaV[i].sqrMagnitude > 0.0001f;
-                    if (hasMovement) hasMovementCount++;
-
-                    // 左右フィルタリング
-                    // ARKitは視聴者視点（アバターを見ている人の視点）で左右を定義:
-                    // eyeBlinkLeft = 視聴者の左 = アバターの右側 = X < 0
-                    // eyeBlinkRight = 視聴者の右 = アバターの左側 = X > 0
-                    float vertexX = vertices[i].x;
-
-                    // 中央付近の閾値（顔の中心線付近の頂点は両方に含める）
-                    const float CENTER_THRESHOLD = 0.0001f;
-
-                    // sideMultiplier: 1.0 = 完全適用, 0.0 = 適用なし, 0.0-1.0 = グラデーション
-                    float sideMultiplier = 1.0f;
-
-                    if (side == BlendShapeSide.LeftOnly)
-                    {
-                        // ARKit Left = 視聴者の左 = アバターの右側 = X < 0
-                        if (vertexX > _blendWidth)
-                        {
-                            // 反対側（アバターの左側）は適用しない
-                            sideMultiplier = 0.0f;
-                        }
-                        else if (vertexX > -_blendWidth)
-                        {
-                            // 中央付近はグラデーション（X=_blendWidthで0、X=-_blendWidthで1）
-                            sideMultiplier = (_blendWidth - vertexX) / (_blendWidth * 2);
-                        }
-                        // else: X < -_blendWidth は完全適用 (1.0)
-                    }
-                    else if (side == BlendShapeSide.RightOnly)
-                    {
-                        // ARKit Right = 視聴者の右 = アバターの左側 = X > 0
-                        if (vertexX < -_blendWidth)
-                        {
-                            // 反対側（アバターの右側）は適用しない
-                            sideMultiplier = 0.0f;
-                        }
-                        else if (vertexX < _blendWidth)
-                        {
-                            // 中央付近はグラデーション（X=-_blendWidthで0、X=_blendWidthで1）
-                            sideMultiplier = (vertexX + _blendWidth) / (_blendWidth * 2);
-                        }
-                        // else: X > _blendWidth は完全適用 (1.0)
-                    }
-                    // Both の場合は sideMultiplier = 1.0 のまま
-
-                    // デバッグカウント
-                    if (vertexX > CENTER_THRESHOLD) leftCount++;
-                    else if (vertexX < -CENTER_THRESHOLD) rightCount++;
-                    else centerCount++;
-
-                    if (sideMultiplier > 0 && hasMovement) appliedCount++;
-
-                    if (sideMultiplier > 0)
-                    {
-                        float finalWeight = adjustedWeight * sideMultiplier;
-                        deltaVertices[i] += srcDeltaV[i] * finalWeight;
-                        deltaNormals[i] += srcDeltaN[i] * finalWeight;
-                        deltaTangents[i] += srcDeltaT[i] * finalWeight;
-                    }
-                }
-
-                if (_debug)
-                {
-                    string sourceName = _mesh.GetBlendShapeName(index);
-                    Log($"  Source '{sourceName}' side={side}: vertices with movement={hasMovementCount}, applied={appliedCount}");
-                    Log($"    Vertex distribution: left(X>0)={leftCount}, right(X<0)={rightCount}, center={centerCount}");
-                }
-            }
-
-            // BlendShapeを追加
-            _mesh.AddBlendShapeFrame(name, 100f, deltaVertices, deltaNormals, deltaTangents);
-            _existingShapes[name] = _mesh.blendShapeCount - 1;
-            _generatedShapes.Add(name);
-
-            Log($"Generated (with side filter): {name} from {sources.Count} source(s)");
         }
 
         private void Log(string message)
@@ -432,7 +133,7 @@ namespace ARKitBlendShapeGenerator
         /// <summary>
         /// VRChat/MMD → ARKit マッピングテーブル
         /// </summary>
-        private List<ARKitMapping> GetMappingTable()
+        internal static List<ARKitMapping> GetMappingTable()
         {
             return new List<ARKitMapping>
             {

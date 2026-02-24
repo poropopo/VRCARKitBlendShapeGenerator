@@ -39,7 +39,6 @@ namespace ARKitBlendShapeGenerator
         private Mesh _originalMesh;
         private Mesh _previewMesh;
         private int _previewBlendShapeIndex = -1;
-        private const string PreviewBlendShapeName = "__ARKitGenerator_Preview__";
 
         private void OnEnable()
         {
@@ -676,28 +675,34 @@ namespace ARKitBlendShapeGenerator
             if (_originalMesh == null)
             {
                 _originalMesh = _component.targetRenderer.sharedMesh;
-                _previewMesh = UnityEngine.Object.Instantiate(_originalMesh);
-                _previewMesh.name = _originalMesh.name + "_Preview";
+                if (_originalMesh == null)
+                {
+                    Debug.LogWarning("[ARKitGenerator Preview] Original mesh is null");
+                    return;
+                }
 
                 // 元のウェイトを保存
                 for (int i = 0; i < _originalMesh.blendShapeCount; i++)
                 {
                     _originalWeights[i] = _component.targetRenderer.GetBlendShapeWeight(i);
                 }
-
-                Debug.Log($"[ARKitGenerator Preview] Initialized preview mesh from {_originalMesh.name}");
             }
 
-            // 既存のプレビューBlendShapeがあれば、新しいメッシュを作り直す
-            if (_previewBlendShapeIndex >= 0)
+            // プレビュー用メッシュを毎回再生成して、本番と同じロジックを適用
+            if (_previewMesh != null)
             {
                 UnityEngine.Object.DestroyImmediate(_previewMesh);
-                _previewMesh = UnityEngine.Object.Instantiate(_originalMesh);
-                _previewMesh.name = _originalMesh.name + "_Preview";
             }
 
-            // プレビュー用BlendShapeを生成（左右フィルタリング対応）
-            GeneratePreviewBlendShape(mapping);
+            _previewMesh = UnityEngine.Object.Instantiate(_originalMesh);
+            _previewMesh.name = _originalMesh.name + "_Preview";
+
+            BlendShapeGenerationEngine.Generate(
+                _originalMesh,
+                _previewMesh,
+                _component.customMappings,
+                BlendShapeProcessor.GetMappingTable(),
+                BlendShapeGenerationOptions.FromComponent(_component));
 
             // プレビューメッシュを適用
             _component.targetRenderer.sharedMesh = _previewMesh;
@@ -705,101 +710,26 @@ namespace ARKitBlendShapeGenerator
             // 全てのBlendShapeをリセット
             foreach (var kvp in _originalWeights)
             {
-                _component.targetRenderer.SetBlendShapeWeight(kvp.Key, kvp.Value);
+                if (kvp.Key < _previewMesh.blendShapeCount)
+                {
+                    _component.targetRenderer.SetBlendShapeWeight(kvp.Key, kvp.Value);
+                }
             }
 
-            // プレビューBlendShapeを適用
+            // 選択中のARKit名をプレビュー適用
+            _previewBlendShapeIndex = _previewMesh.GetBlendShapeIndex(mapping.arkitName);
             if (_previewBlendShapeIndex >= 0)
             {
-                // intensityMultiplierは既にGeneratePreviewBlendShape内で適用済み
                 float weight = _previewWeight * 100f;
                 _component.targetRenderer.SetBlendShapeWeight(_previewBlendShapeIndex, weight);
-
-                Debug.Log($"[ARKitGenerator Preview] Applied preview: {mapping.arkitName}, weight={weight}%, sources={mapping.sources.Count}");
+            }
+            else if (_component.debugMode)
+            {
+                Debug.Log($"[ARKitGenerator Preview] BlendShape not found for preview: {mapping.arkitName}");
             }
 
             // シーンビューを更新
             SceneView.RepaintAll();
-        }
-
-        private void GeneratePreviewBlendShape(CustomBlendShapeMapping mapping)
-        {
-            int vertexCount = _previewMesh.vertexCount;
-            var deltaVertices = new Vector3[vertexCount];
-            var deltaNormals = new Vector3[vertexCount];
-            var deltaTangents = new Vector3[vertexCount];
-
-            // メッシュの頂点座標を取得（左右判定用）
-            var vertices = _previewMesh.vertices;
-
-            int sourceCount = 0;
-            // ソースBlendShapeを合成
-            foreach (var source in mapping.sources)
-            {
-                if (string.IsNullOrEmpty(source.blendShapeName))
-                {
-                    Debug.LogWarning($"[ARKitGenerator Preview] Empty source blendshape name in {mapping.arkitName}");
-                    continue;
-                }
-
-                int srcIndex = _previewMesh.GetBlendShapeIndex(source.blendShapeName);
-                if (srcIndex < 0)
-                {
-                    Debug.LogWarning($"[ARKitGenerator Preview] Source blendshape not found: {source.blendShapeName}");
-                    continue;
-                }
-
-                var srcDeltaV = new Vector3[vertexCount];
-                var srcDeltaN = new Vector3[vertexCount];
-                var srcDeltaT = new Vector3[vertexCount];
-
-                int frameCount = _previewMesh.GetBlendShapeFrameCount(srcIndex);
-                if (frameCount == 0)
-                {
-                    Debug.LogWarning($"[ARKitGenerator Preview] Source blendshape has no frames: {source.blendShapeName}");
-                    continue;
-                }
-
-                _previewMesh.GetBlendShapeFrameVertices(srcIndex, 0, srcDeltaV, srcDeltaN, srcDeltaT);
-                Debug.Log($"[ARKitGenerator Preview] Got frame vertices for {source.blendShapeName}");
-
-                // intensityMultiplierを適用（本番処理と同じ）
-                float adjustedWeight = source.weight * _component.intensityMultiplier;
-
-                for (int i = 0; i < vertexCount; i++)
-                {
-                    // 左右フィルタリング
-                    float vertexX = vertices[i].x;
-
-                    bool shouldApply = source.side switch
-                    {
-                        BlendShapeSide.LeftOnly => vertexX >= -0.001f,
-                        BlendShapeSide.RightOnly => vertexX <= 0.001f,
-                        _ => true
-                    };
-
-                    if (shouldApply)
-                    {
-                        deltaVertices[i] += srcDeltaV[i] * adjustedWeight;
-                        deltaNormals[i] += srcDeltaN[i] * adjustedWeight;
-                        deltaTangents[i] += srcDeltaT[i] * adjustedWeight;
-                    }
-                }
-
-                sourceCount++;
-                Debug.Log($"[ARKitGenerator Preview] Added source: {source.blendShapeName} (weight={adjustedWeight}, side={source.side})");
-            }
-
-            if (sourceCount == 0)
-            {
-                Debug.LogWarning($"[ARKitGenerator Preview] No valid sources found for {mapping.arkitName}");
-            }
-
-            // プレビューBlendShapeを追加
-            _previewMesh.AddBlendShapeFrame(PreviewBlendShapeName, 100f, deltaVertices, deltaNormals, deltaTangents);
-            _previewBlendShapeIndex = _previewMesh.blendShapeCount - 1;
-
-            Debug.Log($"[ARKitGenerator Preview] Generated preview blendshape at index {_previewBlendShapeIndex} from {sourceCount} sources");
         }
 
         private void ResetPreview()
