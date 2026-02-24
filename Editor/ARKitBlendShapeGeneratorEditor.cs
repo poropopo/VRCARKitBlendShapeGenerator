@@ -501,7 +501,10 @@ namespace ARKitBlendShapeGenerator
 
             serializedObject.ApplyModifiedProperties();
 
-            Debug.Log("[ARKitGenerator] VRChat標準表情プリセットを適用しました");
+            if (_component.debugMode)
+            {
+                Debug.Log("[ARKitGenerator] VRChat標準表情プリセットを適用しました");
+            }
         }
 
         /// <summary>
