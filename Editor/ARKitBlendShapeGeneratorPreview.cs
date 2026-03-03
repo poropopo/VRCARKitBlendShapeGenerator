@@ -20,7 +20,7 @@ namespace ARKitBlendShapeGenerator
         /// </summary>
         public static readonly TogglablePreviewNode EnableNode = TogglablePreviewNode.Create(
             () => "ARKit BlendShape Generator",
-            qualifiedName: "com.example.arkit-blendshape-generator/Preview",
+            qualifiedName: "com.qazx7412.kx-vrc-arkit-blendshape-generator/Preview",
             initialState: false
         );
 
@@ -43,25 +43,47 @@ namespace ARKitBlendShapeGenerator
         private IEnumerable<RenderGroup> GroupsForAvatar(ComputeContext context, GameObject avatarRoot)
         {
             // このアバターにARKitBlendShapeGeneratorComponentがあるか確認
-            var components = context.GetComponentsInChildren<ARKitBlendShapeGeneratorComponent>(avatarRoot, true);
+            var components = context
+                .GetComponentsInChildren<ARKitBlendShapeGeneratorComponent>(avatarRoot, true)
+                .Where(c => c != null)
+                .ToArray();
+            var component = SelectPrimaryComponent(avatarRoot, components);
 
-            foreach (var component in components)
+            if (component != null)
             {
-                if (component == null) continue;
-
-                // 対象のRendererを取得
-                var renderer = component.targetRenderer;
+                // targetRenderer変更に追従させる
+                var renderer = context.Observe(component, c => c.targetRenderer);
                 if (renderer == null)
                 {
-                    // GetComponentInChildrenは存在しないため、GameObjectから直接取得
-                    renderer = component.GetComponentInChildren<SkinnedMeshRenderer>(true);
+                    // targetRenderer未設定時は子要素をフォールバック対象にする
+                    renderer = context
+                        .GetComponentsInChildren<SkinnedMeshRenderer>(component.gameObject, true)
+                        .FirstOrDefault();
                 }
 
-                if (renderer != null && renderer.sharedMesh != null)
+                if (renderer != null && context.Observe(renderer, r => r.sharedMesh) != null)
                 {
                     yield return RenderGroup.For(renderer).WithData(component);
                 }
             }
+        }
+
+        private static ARKitBlendShapeGeneratorComponent SelectPrimaryComponent(
+            GameObject avatarRoot,
+            ARKitBlendShapeGeneratorComponent[] components)
+        {
+            if (components == null || components.Length == 0)
+            {
+                return null;
+            }
+
+            var onRoot = components.FirstOrDefault(c => c != null && c.gameObject == avatarRoot);
+            if (onRoot != null)
+            {
+                return onRoot;
+            }
+
+            return components[0];
         }
 
         public Task<IRenderFilterNode> Instantiate(
@@ -69,8 +91,20 @@ namespace ARKitBlendShapeGenerator
             IEnumerable<(Renderer, Renderer)> proxyPairs,
             ComputeContext context)
         {
-            var (original, proxy) = proxyPairs.First();
+            if (group == null || proxyPairs == null)
+            {
+                return Task.FromResult<IRenderFilterNode>(null);
+            }
+
+            var pair = proxyPairs.FirstOrDefault();
+            var original = pair.Item1;
+            var proxy = pair.Item2;
             var component = group.GetData<ARKitBlendShapeGeneratorComponent>();
+
+            if (component == null)
+            {
+                return Task.FromResult<IRenderFilterNode>(null);
+            }
 
             if (original is not SkinnedMeshRenderer originalSmr ||
                 proxy is not SkinnedMeshRenderer proxySmr)
@@ -87,10 +121,14 @@ namespace ARKitBlendShapeGenerator
         /// </summary>
         private class PreviewNode : IRenderFilterNode
         {
+            private Mesh _generatedMesh;
             private readonly ARKitBlendShapeGeneratorComponent _component;
-            private readonly SkinnedMeshRenderer _originalRenderer;
-            private readonly Mesh _generatedMesh;
-            private readonly Dictionary<string, int> _generatedBlendShapeIndices;
+            private readonly int _componentInstanceId;
+            private readonly int _observedComponentConfigRevision;
+            private readonly int _observedTargetRendererInstanceId;
+            private readonly Dictionary<string, int> _shapeIndices = new Dictionary<string, int>();
+            private HashSet<int> _appliedInteractiveIndices = new HashSet<int>();
+            private HashSet<int> _nextAppliedInteractiveIndices = new HashSet<int>();
 
             public RenderAspects WhatChanged => RenderAspects.Mesh | RenderAspects.Shapes;
 
@@ -101,142 +139,48 @@ namespace ARKitBlendShapeGenerator
                 ComputeContext context)
             {
                 _component = component;
-                _originalRenderer = originalRenderer;
-                _generatedBlendShapeIndices = new Dictionary<string, int>();
+                _componentInstanceId = component != null ? component.GetInstanceID() : 0;
+                _observedComponentConfigRevision = context.Observe(ARKitBlendShapeGeneratorPreviewState.ComponentConfigRevision);
 
-                // プレビュー用にBlendShapeを生成
-                _generatedMesh = GeneratePreviewMesh(proxyRenderer);
+                // customMappingsの内容を含むコンポーネント変更全体を監視
+                SkinnedMeshRenderer observedTargetRenderer = null;
+                if (component != null)
+                {
+                    context.Observe(component);
+                    context.Observe(component, c => c.intensityMultiplier);
+                    context.Observe(component, c => c.enableLeftRightSplit);
+                    context.Observe(component, c => c.blendWidth);
+                    context.Observe(component, c => c.overwriteExisting);
+                    observedTargetRenderer = context.Observe(component, c => c.targetRenderer);
+                }
+                _observedTargetRendererInstanceId = observedTargetRenderer != null ? observedTargetRenderer.GetInstanceID() : 0;
 
-                // プロキシにメッシュを適用
+                context.Observe(originalRenderer, r => r.sharedMesh);
+                context.Observe(proxyRenderer, r => r.sharedMesh);
+
+                var sourceMesh = proxyRenderer.sharedMesh ?? originalRenderer.sharedMesh;
+                if (sourceMesh == null)
+                {
+                    return;
+                }
+
+                _generatedMesh = Object.Instantiate(sourceMesh);
+                _generatedMesh.name = sourceMesh.name + "_ARKitPreview";
+
+                var customMappings = component != null ? component.customMappings : null;
+                var options = component != null
+                    ? BlendShapeGenerationOptions.FromComponent(component)
+                    : new BlendShapeGenerationOptions();
+
+                BlendShapeGenerationEngine.Generate(
+                    sourceMesh,
+                    _generatedMesh,
+                    customMappings,
+                    BlendShapeProcessor.GetMappingTable(),
+                    options);
+
+                CacheShapeIndices(_generatedMesh);
                 proxyRenderer.sharedMesh = _generatedMesh;
-            }
-
-            private Mesh GeneratePreviewMesh(SkinnedMeshRenderer proxyRenderer)
-            {
-                var originalMesh = _originalRenderer.sharedMesh;
-                var mesh = Object.Instantiate(originalMesh);
-                mesh.name = originalMesh.name + "_ARKitPreview";
-
-                // 既存のBlendShapeをインデックス化
-                var existingShapes = new Dictionary<string, int>();
-                for (int i = 0; i < originalMesh.blendShapeCount; i++)
-                {
-                    existingShapes[originalMesh.GetBlendShapeName(i)] = i;
-                }
-
-                // カスタムマッピングからBlendShapeを生成
-                if (_component.customMappings != null)
-                {
-                    foreach (var mapping in _component.customMappings)
-                    {
-                        if (!mapping.enabled || string.IsNullOrEmpty(mapping.arkitName))
-                            continue;
-
-                        if (mapping.sources == null || mapping.sources.Count == 0)
-                            continue;
-
-                        // 既に存在し、上書きしない場合はスキップ
-                        if (existingShapes.ContainsKey(mapping.arkitName) && !_component.overwriteExisting)
-                            continue;
-
-                        // BlendShapeを生成
-                        GenerateBlendShapeForMapping(mesh, originalMesh, existingShapes, mapping);
-                    }
-                }
-
-                return mesh;
-            }
-
-            private void GenerateBlendShapeForMapping(
-                Mesh targetMesh,
-                Mesh sourceMesh,
-                Dictionary<string, int> existingShapes,
-                CustomBlendShapeMapping mapping)
-            {
-                int vertexCount = sourceMesh.vertexCount;
-                var deltaVertices = new Vector3[vertexCount];
-                var deltaNormals = new Vector3[vertexCount];
-                var deltaTangents = new Vector3[vertexCount];
-                var vertices = sourceMesh.vertices;
-
-                int sourceCount = 0;
-
-                foreach (var source in mapping.sources)
-                {
-                    if (string.IsNullOrEmpty(source.blendShapeName))
-                        continue;
-
-                    if (!existingShapes.TryGetValue(source.blendShapeName, out int srcIndex))
-                        continue;
-
-                    var srcDeltaV = new Vector3[vertexCount];
-                    var srcDeltaN = new Vector3[vertexCount];
-                    var srcDeltaT = new Vector3[vertexCount];
-
-                    int frameCount = sourceMesh.GetBlendShapeFrameCount(srcIndex);
-                    if (frameCount == 0)
-                        continue;
-
-                    int targetFrame = frameCount > 0 ? frameCount - 1 : 0;
-                    sourceMesh.GetBlendShapeFrameVertices(srcIndex, targetFrame, srcDeltaV, srcDeltaN, srcDeltaT);
-
-                    float adjustedWeight = source.weight * _component.intensityMultiplier;
-
-                    for (int i = 0; i < vertexCount; i++)
-                    {
-                        // 左右フィルタリング（enableLeftRightSplitがtrueの場合のみ）
-                        // ARKitは視聴者視点（アバターを見ている人の視点）で左右を定義:
-                        // eyeBlinkLeft = 視聴者の左 = アバターの右側 = X < 0
-                        // eyeBlinkRight = 視聴者の右 = アバターの左側 = X > 0
-                        float sideMultiplier = 1.0f;
-                        if (_component.enableLeftRightSplit && source.side != BlendShapeSide.Both)
-                        {
-                            float vertexX = vertices[i].x;
-                            float blendWidth = _component.blendWidth;
-
-                            if (source.side == BlendShapeSide.LeftOnly)
-                            {
-                                // ARKit Left = 視聴者の左 = アバターの右側 = X < 0
-                                if (vertexX > blendWidth)
-                                {
-                                    sideMultiplier = 0.0f;
-                                }
-                                else if (vertexX > -blendWidth)
-                                {
-                                    sideMultiplier = (blendWidth - vertexX) / (blendWidth * 2);
-                                }
-                            }
-                            else if (source.side == BlendShapeSide.RightOnly)
-                            {
-                                // ARKit Right = 視聴者の右 = アバターの左側 = X > 0
-                                if (vertexX < -blendWidth)
-                                {
-                                    sideMultiplier = 0.0f;
-                                }
-                                else if (vertexX < blendWidth)
-                                {
-                                    sideMultiplier = (vertexX + blendWidth) / (blendWidth * 2);
-                                }
-                            }
-                        }
-
-                        if (sideMultiplier > 0)
-                        {
-                            float finalWeight = adjustedWeight * sideMultiplier;
-                            deltaVertices[i] += srcDeltaV[i] * finalWeight;
-                            deltaNormals[i] += srcDeltaN[i] * finalWeight;
-                            deltaTangents[i] += srcDeltaT[i] * finalWeight;
-                        }
-                    }
-
-                    sourceCount++;
-                }
-
-                if (sourceCount > 0)
-                {
-                    targetMesh.AddBlendShapeFrame(mapping.arkitName, 100f, deltaVertices, deltaNormals, deltaTangents);
-                    _generatedBlendShapeIndices[mapping.arkitName] = targetMesh.blendShapeCount - 1;
-                }
             }
 
             public Task<IRenderFilterNode> Refresh(
@@ -244,8 +188,35 @@ namespace ARKitBlendShapeGenerator
                 ComputeContext context,
                 RenderAspects updatedAspects)
             {
-                // メッシュが変わった場合は再生成が必要
+                if (_generatedMesh == null || proxyPairs == null)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                int currentConfigRevision = context.Observe(ARKitBlendShapeGeneratorPreviewState.ComponentConfigRevision);
+                if (currentConfigRevision != _observedComponentConfigRevision)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
                 if ((updatedAspects & RenderAspects.Mesh) != 0)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                if (_component != null)
+                {
+                    var currentTargetRenderer = context.Observe(_component, c => c.targetRenderer);
+                    int currentTargetRendererId = currentTargetRenderer != null ? currentTargetRenderer.GetInstanceID() : 0;
+                    if (currentTargetRendererId != _observedTargetRendererInstanceId)
+                    {
+                        return Task.FromResult<IRenderFilterNode>(null);
+                    }
+                }
+
+                var pair = proxyPairs.FirstOrDefault();
+                if (pair.Item1 is not SkinnedMeshRenderer ||
+                    pair.Item2 is not SkinnedMeshRenderer)
                 {
                     return Task.FromResult<IRenderFilterNode>(null);
                 }
@@ -255,21 +226,93 @@ namespace ARKitBlendShapeGenerator
 
             public void OnFrame(Renderer original, Renderer proxy)
             {
-                if (proxy is not SkinnedMeshRenderer proxySmr) return;
+                if (_generatedMesh == null || proxy is not SkinnedMeshRenderer proxySmr) return;
 
                 // プロキシのメッシュが正しいか確認
                 if (proxySmr.sharedMesh != _generatedMesh)
                 {
                     proxySmr.sharedMesh = _generatedMesh;
                 }
+
+                var interactiveState = ARKitBlendShapeGeneratorPreviewState.Current;
+                if (!interactiveState.InteractiveEnabled ||
+                    interactiveState.ActiveComponentInstanceId != _componentInstanceId)
+                {
+                    ClearAppliedInteractiveWeights(proxySmr);
+                    return;
+                }
+
+                _nextAppliedInteractiveIndices.Clear();
+                foreach (var kvp in interactiveState.WeightsByArkitName)
+                {
+                    if (!_shapeIndices.TryGetValue(kvp.Key, out int blendShapeIndex))
+                    {
+                        continue;
+                    }
+
+                    float clamped = Mathf.Clamp01(kvp.Value) * 100f;
+                    if (clamped <= 0.0001f)
+                    {
+                        continue;
+                    }
+
+                    proxySmr.SetBlendShapeWeight(blendShapeIndex, clamped);
+                    _nextAppliedInteractiveIndices.Add(blendShapeIndex);
+                }
+
+                foreach (int previouslyAppliedIndex in _appliedInteractiveIndices)
+                {
+                    if (!_nextAppliedInteractiveIndices.Contains(previouslyAppliedIndex))
+                    {
+                        proxySmr.SetBlendShapeWeight(previouslyAppliedIndex, 0f);
+                    }
+                }
+
+                var swap = _appliedInteractiveIndices;
+                _appliedInteractiveIndices = _nextAppliedInteractiveIndices;
+                _nextAppliedInteractiveIndices = swap;
+            }
+
+            private void CacheShapeIndices(Mesh mesh)
+            {
+                _shapeIndices.Clear();
+                if (mesh == null)
+                {
+                    return;
+                }
+
+                for (int i = 0; i < mesh.blendShapeCount; i++)
+                {
+                    string shapeName = mesh.GetBlendShapeName(i);
+                    if (string.IsNullOrEmpty(shapeName) || _shapeIndices.ContainsKey(shapeName))
+                    {
+                        continue;
+                    }
+
+                    _shapeIndices.Add(shapeName, i);
+                }
             }
 
             public void Dispose()
             {
+                _appliedInteractiveIndices.Clear();
+                _nextAppliedInteractiveIndices.Clear();
+
                 if (_generatedMesh != null)
                 {
                     Object.DestroyImmediate(_generatedMesh);
                 }
+            }
+
+            private void ClearAppliedInteractiveWeights(SkinnedMeshRenderer proxySmr)
+            {
+                foreach (int index in _appliedInteractiveIndices)
+                {
+                    proxySmr.SetBlendShapeWeight(index, 0f);
+                }
+
+                _appliedInteractiveIndices.Clear();
+                _nextAppliedInteractiveIndices.Clear();
             }
         }
     }
