@@ -60,6 +60,15 @@ namespace ARKitBlendShapeGenerator
 
         private void ProcessComponent(ARKitBlendShapeGeneratorComponent component, BuildContext ctx)
         {
+            if (CustomMappingValidation.HasDuplicateArkitNames(component.customMappings, out var duplicateArkitNames))
+            {
+                Debug.LogError(
+                    "[ARKitGenerator] カスタムマッピングで同一ARKit名が重複しているため、生成を中止しました。\n" +
+                    $"重複: {string.Join(", ", duplicateArkitNames)}",
+                    component);
+                return;
+            }
+
             var renderer = component.targetRenderer;
             if (renderer == null)
             {

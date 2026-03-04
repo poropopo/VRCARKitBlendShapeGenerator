@@ -71,6 +71,18 @@ namespace ARKitBlendShapeGenerator
             }
         }
 
+        private sealed class PlannedBlendShape
+        {
+            public readonly string ArkitName;
+            public readonly List<(int index, float weight, BlendShapeSide side)> Sources;
+
+            public PlannedBlendShape(string arkitName, List<(int index, float weight, BlendShapeSide side)> sources)
+            {
+                ArkitName = arkitName;
+                Sources = sources;
+            }
+        }
+
         public static BlendShapeGenerationResult Generate(
             Mesh sourceMesh,
             Mesh targetMesh,
@@ -100,6 +112,16 @@ namespace ARKitBlendShapeGenerator
                 autoMappings = new List<ARKitMapping>();
             }
 
+            if (CustomMappingValidation.HasDuplicateArkitNames(customMappings, out var duplicateArkitNames))
+            {
+                Debug.LogError(
+                    "[ARKitGenerator] カスタムマッピングで同一ARKit名が重複しているため、生成を中止しました。\n" +
+                    $"重複: {string.Join(", ", duplicateArkitNames)}");
+                return new BlendShapeGenerationResult(
+                    new List<string>(),
+                    new Dictionary<string, int>());
+            }
+
             var existingShapes = new Dictionary<string, int>();
             for (int i = 0; i < sourceMesh.blendShapeCount; i++)
             {
@@ -108,36 +130,59 @@ namespace ARKitBlendShapeGenerator
 
             var generatedShapes = new List<string>();
             var customMappedNames = new HashSet<string>();
+            var plannedBlendShapes = new List<PlannedBlendShape>();
 
-            ProcessCustomMappings(
+            CollectCustomMappings(
                 sourceMesh,
-                targetMesh,
                 customMappings,
                 options,
                 existingShapes,
                 customMappedNames,
-                generatedShapes);
+                plannedBlendShapes);
 
-            ProcessAutoMappings(
+            CollectAutoMappings(
                 sourceMesh,
-                targetMesh,
                 autoMappings,
                 options,
                 existingShapes,
                 customMappedNames,
-                generatedShapes);
+                plannedBlendShapes);
+
+            if (options.OverwriteExisting && plannedBlendShapes.Count > 0)
+            {
+                var namesToReplace = new HashSet<string>(
+                    plannedBlendShapes.Select(planned => planned.ArkitName));
+                namesToReplace.IntersectWith(GetExistingBlendShapeNames(targetMesh));
+
+                if (namesToReplace.Count > 0)
+                {
+                    int removedCount = RemoveBlendShapesByNames(targetMesh, namesToReplace);
+                    if (removedCount > 0)
+                    {
+                        Log(options, $"Replaced existing blendshapes: {string.Join(", ", namesToReplace.OrderBy(name => name))}");
+                    }
+                }
+            }
+
+            foreach (var planned in plannedBlendShapes)
+            {
+                if (TryAddBlendShape(sourceMesh, targetMesh, planned.ArkitName, planned.Sources, options))
+                {
+                    existingShapes[planned.ArkitName] = targetMesh.blendShapeCount - 1;
+                    generatedShapes.Add(planned.ArkitName);
+                }
+            }
 
             return new BlendShapeGenerationResult(generatedShapes, existingShapes);
         }
 
-        private static void ProcessCustomMappings(
+        private static void CollectCustomMappings(
             Mesh sourceMesh,
-            Mesh targetMesh,
             List<CustomBlendShapeMapping> customMappings,
             BlendShapeGenerationOptions options,
             Dictionary<string, int> existingShapes,
             HashSet<string> customMappedNames,
-            List<string> generatedShapes)
+            List<PlannedBlendShape> plannedBlendShapes)
         {
             foreach (var mapping in customMappings)
             {
@@ -183,22 +228,17 @@ namespace ARKitBlendShapeGenerator
                     continue;
                 }
 
-                if (TryAddBlendShape(sourceMesh, targetMesh, mapping.arkitName, sources, options))
-                {
-                    existingShapes[mapping.arkitName] = targetMesh.blendShapeCount - 1;
-                    generatedShapes.Add(mapping.arkitName);
-                }
+                plannedBlendShapes.Add(new PlannedBlendShape(mapping.arkitName, sources));
             }
         }
 
-        private static void ProcessAutoMappings(
+        private static void CollectAutoMappings(
             Mesh sourceMesh,
-            Mesh targetMesh,
             List<ARKitMapping> autoMappings,
             BlendShapeGenerationOptions options,
             Dictionary<string, int> existingShapes,
             HashSet<string> customMappedNames,
-            List<string> generatedShapes)
+            List<PlannedBlendShape> plannedBlendShapes)
         {
             var processedArkitNames = new HashSet<string>();
 
@@ -237,12 +277,8 @@ namespace ARKitBlendShapeGenerator
                 var side = options.EnableLeftRightSplit ? mapping.side : BlendShapeSide.Both;
                 var sourcesWithSide = sources.Select(s => (s.index, s.weight, side)).ToList();
 
-                if (TryAddBlendShape(sourceMesh, targetMesh, mapping.arkitName, sourcesWithSide, options))
-                {
-                    existingShapes[mapping.arkitName] = targetMesh.blendShapeCount - 1;
-                    generatedShapes.Add(mapping.arkitName);
-                    processedArkitNames.Add(mapping.arkitName);
-                }
+                plannedBlendShapes.Add(new PlannedBlendShape(mapping.arkitName, sourcesWithSide));
+                processedArkitNames.Add(mapping.arkitName);
             }
         }
 
@@ -384,52 +420,46 @@ namespace ARKitBlendShapeGenerator
                 return false;
             }
 
-            if (options.OverwriteExisting && ContainsBlendShape(targetMesh, arkitName))
-            {
-                if (RemoveBlendShapeByName(targetMesh, arkitName))
-                {
-                    Log(options, $"Replaced existing blendshape: {arkitName}");
-                }
-            }
-
             targetMesh.AddBlendShapeFrame(arkitName, 100f, deltaVertices, deltaNormals, deltaTangents);
             Log(options, $"Generated: {arkitName} from {sourceCount} source(s)");
             return true;
         }
 
-        private static bool ContainsBlendShape(Mesh mesh, string shapeName)
+        private static HashSet<string> GetExistingBlendShapeNames(Mesh mesh)
         {
-            if (mesh == null || string.IsNullOrEmpty(shapeName))
+            var result = new HashSet<string>();
+            if (mesh == null)
             {
-                return false;
+                return result;
             }
 
             for (int i = 0; i < mesh.blendShapeCount; i++)
             {
-                if (mesh.GetBlendShapeName(i) == shapeName)
+                var shapeName = mesh.GetBlendShapeName(i);
+                if (!string.IsNullOrEmpty(shapeName))
                 {
-                    return true;
+                    result.Add(shapeName);
                 }
             }
 
-            return false;
+            return result;
         }
 
-        private static bool RemoveBlendShapeByName(Mesh mesh, string shapeName)
+        private static int RemoveBlendShapesByNames(Mesh mesh, HashSet<string> shapeNamesToRemove)
         {
-            if (mesh == null || string.IsNullOrEmpty(shapeName))
+            if (mesh == null || shapeNamesToRemove == null || shapeNamesToRemove.Count == 0)
             {
-                return false;
+                return 0;
             }
 
             int blendShapeCount = mesh.blendShapeCount;
             if (blendShapeCount == 0)
             {
-                return false;
+                return 0;
             }
 
             int vertexCount = mesh.vertexCount;
-            bool removed = false;
+            int removedCount = 0;
             var preserved = new List<BlendShapeData>(blendShapeCount);
 
             for (int shapeIndex = 0; shapeIndex < blendShapeCount; shapeIndex++)
@@ -440,9 +470,9 @@ namespace ARKitBlendShapeGenerator
                     continue;
                 }
 
-                if (existingName == shapeName)
+                if (shapeNamesToRemove.Contains(existingName))
                 {
-                    removed = true;
+                    removedCount++;
                     continue;
                 }
 
@@ -472,9 +502,9 @@ namespace ARKitBlendShapeGenerator
                 preserved.Add(new BlendShapeData(existingName, frames));
             }
 
-            if (!removed)
+            if (removedCount == 0)
             {
-                return false;
+                return 0;
             }
 
             mesh.ClearBlendShapes();
@@ -491,7 +521,7 @@ namespace ARKitBlendShapeGenerator
                 }
             }
 
-            return true;
+            return removedCount;
         }
 
         private static void Log(BlendShapeGenerationOptions options, string message)

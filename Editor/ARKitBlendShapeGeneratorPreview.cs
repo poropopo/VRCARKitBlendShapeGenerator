@@ -106,6 +106,15 @@ namespace ARKitBlendShapeGenerator
                 return Task.FromResult<IRenderFilterNode>(null);
             }
 
+            if (CustomMappingValidation.HasDuplicateArkitNames(component.customMappings, out var duplicateArkitNames))
+            {
+                Debug.LogError(
+                    "[ARKitGenerator] カスタムマッピングで同一ARKit名が重複しています。重複を解消するまでプレビューを停止します。\n" +
+                    $"重複: {string.Join(", ", duplicateArkitNames)}",
+                    component);
+                return Task.FromResult<IRenderFilterNode>(null);
+            }
+
             if (original is not SkinnedMeshRenderer originalSmr ||
                 proxy is not SkinnedMeshRenderer proxySmr)
             {
