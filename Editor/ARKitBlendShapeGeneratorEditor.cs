@@ -193,6 +193,15 @@ namespace ARKitBlendShapeGenerator
                 MessageType.Info
             );
 
+            var duplicateArkitNames = CustomMappingValidation.GetDuplicateArkitNames(_component.customMappings);
+            if (duplicateArkitNames.Count > 0)
+            {
+                EditorGUILayout.HelpBox(
+                    CustomMappingValidation.BuildDuplicateMessage(duplicateArkitNames) +
+                    "\n重複を解消するまでプレビュー/生成は停止されます。",
+                    MessageType.Error);
+            }
+
             // VRChat標準表情のみを使用したプリセット
             EditorGUILayout.LabelField("プリセット", EditorStyles.miniBoldLabel);
             EditorGUILayout.BeginHorizontal();
@@ -358,13 +367,66 @@ namespace ARKitBlendShapeGenerator
             return 46f + (sourceCount * 22f);
         }
 
+        private List<string> GetSelectableArkitNames(int mappingIndex)
+        {
+            var allArkitNames = ARKitBlendShapeNames.GetAll();
+            var customMappings = _component.customMappings ?? new List<CustomBlendShapeMapping>();
+            var usedByOthers = new HashSet<string>(
+                customMappings
+                    .Where((mapping, index) =>
+                        index != mappingIndex &&
+                        mapping != null &&
+                        !string.IsNullOrWhiteSpace(mapping.arkitName))
+                    .Select(mapping => mapping.arkitName.Trim()));
+
+            var options = allArkitNames
+                .Where(name => !usedByOthers.Contains(name))
+                .ToList();
+
+            if (mappingIndex < 0 || mappingIndex >= customMappings.Count)
+            {
+                return options;
+            }
+
+            var currentName = customMappings[mappingIndex]?.arkitName;
+            if (!string.IsNullOrWhiteSpace(currentName))
+            {
+                var trimmedCurrentName = currentName.Trim();
+                if (!options.Contains(trimmedCurrentName))
+                {
+                    options.Insert(0, trimmedCurrentName);
+                }
+            }
+
+            return options;
+        }
+
+        private string GetFirstUnusedArkitName()
+        {
+            var customMappings = _component.customMappings ?? new List<CustomBlendShapeMapping>();
+            var usedNames = new HashSet<string>(
+                customMappings
+                    .Where(mapping => mapping != null && !string.IsNullOrWhiteSpace(mapping.arkitName))
+                    .Select(mapping => mapping.arkitName.Trim()));
+
+            foreach (var arkitName in ARKitBlendShapeNames.GetAll())
+            {
+                if (!usedNames.Contains(arkitName))
+                {
+                    return arkitName;
+                }
+            }
+
+            return null;
+        }
+
         private void AddCategoryMappings(string[] arkitNames)
         {
             Undo.RecordObject(_component, "Add Category Mappings");
 
             foreach (var name in arkitNames)
             {
-                if (_component.customMappings.Any(m => m.arkitName == name))
+                if (_component.customMappings.Any(m => m != null && m.arkitName == name))
                     continue;
 
                 _component.customMappings.Add(new CustomBlendShapeMapping
@@ -394,16 +456,27 @@ namespace ARKitBlendShapeGenerator
                 MarkComponentChanged();
             }
 
-            // ARKit名のドロップダウン
-            var arkitNames = ARKitBlendShapeNames.GetAll();
-            int currentIndex = System.Array.IndexOf(arkitNames, mapping.arkitName);
-            if (currentIndex < 0) currentIndex = 0;
-
-            int newIndex = EditorGUILayout.Popup(currentIndex, arkitNames);
-            if (newIndex != currentIndex || string.IsNullOrEmpty(mapping.arkitName))
+            // ARKit名のドロップダウン（同一ARKit名の重複は選択不可）
+            var selectableArkitNames = GetSelectableArkitNames(index);
+            if (selectableArkitNames.Count == 0)
             {
-                mapping.arkitName = arkitNames[newIndex];
-                MarkComponentChanged();
+                EditorGUILayout.LabelField("(利用可能なARKit名なし)");
+            }
+            else
+            {
+                string currentArkitName = string.IsNullOrWhiteSpace(mapping.arkitName)
+                    ? null
+                    : mapping.arkitName.Trim();
+                int currentIndex = selectableArkitNames.IndexOf(currentArkitName);
+                if (currentIndex < 0) currentIndex = 0;
+
+                int newIndex = EditorGUILayout.Popup(currentIndex, selectableArkitNames.ToArray());
+                string selectedArkitName = selectableArkitNames[newIndex];
+                if (!string.Equals(mapping.arkitName, selectedArkitName))
+                {
+                    mapping.arkitName = selectedArkitName;
+                    MarkComponentChanged();
+                }
             }
 
             if (GUILayout.Button("+", GUILayout.Width(25)))
@@ -512,9 +585,19 @@ namespace ARKitBlendShapeGenerator
 
         private void AddNewMapping()
         {
+            string firstUnusedArkitName = GetFirstUnusedArkitName();
+            if (string.IsNullOrEmpty(firstUnusedArkitName))
+            {
+                EditorUtility.DisplayDialog(
+                    "ARKit BlendShape Generator",
+                    "追加可能なARKit名がありません。\n既存マッピングを削除するか、ARKit名を変更してください。",
+                    "OK");
+                return;
+            }
+
             var newMapping = new CustomBlendShapeMapping
             {
-                arkitName = "eyeBlinkLeft",
+                arkitName = firstUnusedArkitName,
                 enabled = true,
                 sources = new List<BlendShapeSource>()
             };

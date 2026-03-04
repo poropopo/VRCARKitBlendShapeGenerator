@@ -106,6 +106,15 @@ namespace ARKitBlendShapeGenerator
                 return Task.FromResult<IRenderFilterNode>(null);
             }
 
+            if (CustomMappingValidation.HasDuplicateArkitNames(component.customMappings, out var duplicateArkitNames))
+            {
+                Debug.LogError(
+                    "[ARKitGenerator] カスタムマッピングで同一ARKit名が重複しています。重複を解消するまでプレビューを停止します。\n" +
+                    $"重複: {string.Join(", ", duplicateArkitNames)}",
+                    component);
+                return Task.FromResult<IRenderFilterNode>(null);
+            }
+
             if (original is not SkinnedMeshRenderer originalSmr ||
                 proxy is not SkinnedMeshRenderer proxySmr)
             {
@@ -125,7 +134,12 @@ namespace ARKitBlendShapeGenerator
             private readonly ARKitBlendShapeGeneratorComponent _component;
             private readonly int _componentInstanceId;
             private readonly int _observedComponentConfigRevision;
+            private readonly float _observedIntensityMultiplier;
+            private readonly bool _observedEnableLeftRightSplit;
+            private readonly float _observedBlendWidth;
+            private readonly bool _observedOverwriteExisting;
             private readonly int _observedTargetRendererInstanceId;
+            private readonly int _observedCustomMappingsSignature;
             private readonly Dictionary<string, int> _shapeIndices = new Dictionary<string, int>();
             private HashSet<int> _appliedInteractiveIndices = new HashSet<int>();
             private HashSet<int> _nextAppliedInteractiveIndices = new HashSet<int>();
@@ -143,16 +157,28 @@ namespace ARKitBlendShapeGenerator
                 _observedComponentConfigRevision = context.Observe(ARKitBlendShapeGeneratorPreviewState.ComponentConfigRevision);
 
                 // customMappingsの内容を含むコンポーネント変更全体を監視
+                float observedIntensityMultiplier = 0f;
+                bool observedEnableLeftRightSplit = false;
+                float observedBlendWidth = 0f;
+                bool observedOverwriteExisting = false;
+                int observedCustomMappingsSignature = 0;
                 SkinnedMeshRenderer observedTargetRenderer = null;
                 if (component != null)
                 {
                     context.Observe(component);
-                    context.Observe(component, c => c.intensityMultiplier);
-                    context.Observe(component, c => c.enableLeftRightSplit);
-                    context.Observe(component, c => c.blendWidth);
-                    context.Observe(component, c => c.overwriteExisting);
+                    observedIntensityMultiplier = context.Observe(component, c => c.intensityMultiplier);
+                    observedEnableLeftRightSplit = context.Observe(component, c => c.enableLeftRightSplit);
+                    observedBlendWidth = context.Observe(component, c => c.blendWidth);
+                    observedOverwriteExisting = context.Observe(component, c => c.overwriteExisting);
+                    observedCustomMappingsSignature = BuildCustomMappingsSignature(component.customMappings);
                     observedTargetRenderer = context.Observe(component, c => c.targetRenderer);
                 }
+
+                _observedIntensityMultiplier = observedIntensityMultiplier;
+                _observedEnableLeftRightSplit = observedEnableLeftRightSplit;
+                _observedBlendWidth = observedBlendWidth;
+                _observedOverwriteExisting = observedOverwriteExisting;
+                _observedCustomMappingsSignature = observedCustomMappingsSignature;
                 _observedTargetRendererInstanceId = observedTargetRenderer != null ? observedTargetRenderer.GetInstanceID() : 0;
 
                 context.Observe(originalRenderer, r => r.sharedMesh);
@@ -188,7 +214,7 @@ namespace ARKitBlendShapeGenerator
                 ComputeContext context,
                 RenderAspects updatedAspects)
             {
-                if (_generatedMesh == null || proxyPairs == null)
+                if (_generatedMesh == null || proxyPairs == null || _component == null)
                 {
                     return Task.FromResult<IRenderFilterNode>(null);
                 }
@@ -204,14 +230,43 @@ namespace ARKitBlendShapeGenerator
                     return Task.FromResult<IRenderFilterNode>(null);
                 }
 
-                if (_component != null)
+                context.Observe(_component);
+
+                float currentIntensityMultiplier = context.Observe(_component, c => c.intensityMultiplier);
+                if (!Mathf.Approximately(currentIntensityMultiplier, _observedIntensityMultiplier))
                 {
-                    var currentTargetRenderer = context.Observe(_component, c => c.targetRenderer);
-                    int currentTargetRendererId = currentTargetRenderer != null ? currentTargetRenderer.GetInstanceID() : 0;
-                    if (currentTargetRendererId != _observedTargetRendererInstanceId)
-                    {
-                        return Task.FromResult<IRenderFilterNode>(null);
-                    }
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                bool currentEnableLeftRightSplit = context.Observe(_component, c => c.enableLeftRightSplit);
+                if (currentEnableLeftRightSplit != _observedEnableLeftRightSplit)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                float currentBlendWidth = context.Observe(_component, c => c.blendWidth);
+                if (!Mathf.Approximately(currentBlendWidth, _observedBlendWidth))
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                bool currentOverwriteExisting = context.Observe(_component, c => c.overwriteExisting);
+                if (currentOverwriteExisting != _observedOverwriteExisting)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                int currentCustomMappingsSignature = BuildCustomMappingsSignature(_component.customMappings);
+                if (currentCustomMappingsSignature != _observedCustomMappingsSignature)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
+                }
+
+                var currentTargetRenderer = context.Observe(_component, c => c.targetRenderer);
+                int currentTargetRendererId = currentTargetRenderer != null ? currentTargetRenderer.GetInstanceID() : 0;
+                if (currentTargetRendererId != _observedTargetRendererInstanceId)
+                {
+                    return Task.FromResult<IRenderFilterNode>(null);
                 }
 
                 var pair = proxyPairs.FirstOrDefault();
@@ -284,13 +339,67 @@ namespace ARKitBlendShapeGenerator
                 for (int i = 0; i < mesh.blendShapeCount; i++)
                 {
                     string shapeName = mesh.GetBlendShapeName(i);
-                    if (string.IsNullOrEmpty(shapeName) || _shapeIndices.ContainsKey(shapeName))
+                    if (string.IsNullOrEmpty(shapeName))
                     {
                         continue;
                     }
 
-                    _shapeIndices.Add(shapeName, i);
+                    // 同名がある場合は後勝ちにして、overwriteExistingで再生成された最新indexを使う。
+                    _shapeIndices[shapeName] = i;
                 }
+            }
+
+            private static int BuildCustomMappingsSignature(List<CustomBlendShapeMapping> customMappings)
+            {
+                unchecked
+                {
+                    int hash = 17;
+                    if (customMappings == null)
+                    {
+                        return hash;
+                    }
+
+                    hash = (hash * 31) + customMappings.Count;
+                    foreach (var mapping in customMappings)
+                    {
+                        if (mapping == null)
+                        {
+                            hash = (hash * 31) + 1;
+                            continue;
+                        }
+
+                        hash = (hash * 31) + (mapping.enabled ? 1 : 0);
+                        hash = (hash * 31) + HashString(mapping.arkitName);
+
+                        var sources = mapping.sources;
+                        if (sources == null)
+                        {
+                            hash = (hash * 31) + 2;
+                            continue;
+                        }
+
+                        hash = (hash * 31) + sources.Count;
+                        foreach (var source in sources)
+                        {
+                            if (source == null)
+                            {
+                                hash = (hash * 31) + 3;
+                                continue;
+                            }
+
+                            hash = (hash * 31) + HashString(source.blendShapeName);
+                            hash = (hash * 31) + source.weight.GetHashCode();
+                            hash = (hash * 31) + (int)source.side;
+                        }
+                    }
+
+                    return hash;
+                }
+            }
+
+            private static int HashString(string value)
+            {
+                return value != null ? value.GetHashCode() : 0;
             }
 
             public void Dispose()
