@@ -39,6 +39,38 @@ namespace ARKitBlendShapeGenerator
 
     internal static class BlendShapeGenerationEngine
     {
+        private sealed class BlendShapeFrameData
+        {
+            public readonly float Weight;
+            public readonly Vector3[] DeltaVertices;
+            public readonly Vector3[] DeltaNormals;
+            public readonly Vector3[] DeltaTangents;
+
+            public BlendShapeFrameData(
+                float weight,
+                Vector3[] deltaVertices,
+                Vector3[] deltaNormals,
+                Vector3[] deltaTangents)
+            {
+                Weight = weight;
+                DeltaVertices = deltaVertices;
+                DeltaNormals = deltaNormals;
+                DeltaTangents = deltaTangents;
+            }
+        }
+
+        private sealed class BlendShapeData
+        {
+            public readonly string Name;
+            public readonly List<BlendShapeFrameData> Frames;
+
+            public BlendShapeData(string name, List<BlendShapeFrameData> frames)
+            {
+                Name = name;
+                Frames = frames;
+            }
+        }
+
         public static BlendShapeGenerationResult Generate(
             Mesh sourceMesh,
             Mesh targetMesh,
@@ -352,8 +384,113 @@ namespace ARKitBlendShapeGenerator
                 return false;
             }
 
+            if (options.OverwriteExisting && ContainsBlendShape(targetMesh, arkitName))
+            {
+                if (RemoveBlendShapeByName(targetMesh, arkitName))
+                {
+                    Log(options, $"Replaced existing blendshape: {arkitName}");
+                }
+            }
+
             targetMesh.AddBlendShapeFrame(arkitName, 100f, deltaVertices, deltaNormals, deltaTangents);
             Log(options, $"Generated: {arkitName} from {sourceCount} source(s)");
+            return true;
+        }
+
+        private static bool ContainsBlendShape(Mesh mesh, string shapeName)
+        {
+            if (mesh == null || string.IsNullOrEmpty(shapeName))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < mesh.blendShapeCount; i++)
+            {
+                if (mesh.GetBlendShapeName(i) == shapeName)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool RemoveBlendShapeByName(Mesh mesh, string shapeName)
+        {
+            if (mesh == null || string.IsNullOrEmpty(shapeName))
+            {
+                return false;
+            }
+
+            int blendShapeCount = mesh.blendShapeCount;
+            if (blendShapeCount == 0)
+            {
+                return false;
+            }
+
+            int vertexCount = mesh.vertexCount;
+            bool removed = false;
+            var preserved = new List<BlendShapeData>(blendShapeCount);
+
+            for (int shapeIndex = 0; shapeIndex < blendShapeCount; shapeIndex++)
+            {
+                string existingName = mesh.GetBlendShapeName(shapeIndex);
+                if (string.IsNullOrEmpty(existingName))
+                {
+                    continue;
+                }
+
+                if (existingName == shapeName)
+                {
+                    removed = true;
+                    continue;
+                }
+
+                int frameCount = mesh.GetBlendShapeFrameCount(shapeIndex);
+                var frames = new List<BlendShapeFrameData>(frameCount);
+                for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
+                {
+                    float frameWeight = mesh.GetBlendShapeFrameWeight(shapeIndex, frameIndex);
+                    var deltaVertices = new Vector3[vertexCount];
+                    var deltaNormals = new Vector3[vertexCount];
+                    var deltaTangents = new Vector3[vertexCount];
+
+                    mesh.GetBlendShapeFrameVertices(
+                        shapeIndex,
+                        frameIndex,
+                        deltaVertices,
+                        deltaNormals,
+                        deltaTangents);
+
+                    frames.Add(new BlendShapeFrameData(
+                        frameWeight,
+                        deltaVertices,
+                        deltaNormals,
+                        deltaTangents));
+                }
+
+                preserved.Add(new BlendShapeData(existingName, frames));
+            }
+
+            if (!removed)
+            {
+                return false;
+            }
+
+            mesh.ClearBlendShapes();
+            foreach (var shape in preserved)
+            {
+                foreach (var frame in shape.Frames)
+                {
+                    mesh.AddBlendShapeFrame(
+                        shape.Name,
+                        frame.Weight,
+                        frame.DeltaVertices,
+                        frame.DeltaNormals,
+                        frame.DeltaTangents);
+                }
+            }
+
             return true;
         }
 
